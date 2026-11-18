@@ -17,6 +17,12 @@
 排除通配规则：不含 `/` 时按名字匹配任意层级（`*.log`、`build`）；含 `/` 时匹配相对
 路径，`**` 跨目录、`*` 单层、`?` 单字符，命中目录会连带其下全部内容一起排除。
 
+排除串里以 `!` 开头的一项是内容豁免规则：`!replace:路径通配:行号:文本A:文本B`。路径
+通配沿用上面的写法，行号从 1 起算、可写 `*` 表示任意行；命中文件在指定行内把文本A 与
+文本B 一并换成同一个占位符后再比较，一致就不计为异常（只在明细后附带一句统计）。两段
+文本按原样匹配而非正则；文本A 取到下一个 `:` 为止（可含空格），文本B 取到下一个分隔符
+为止（可含 `:`），需要包含分隔符的参数用引号包裹：`!replace:a.c:127:"v: 1":"v: 2"`。
+
 注释用 `#`：可整行注释，也可写在行尾（`#` 前需有空白，因此路径里的 `#` 不受影响，
 引号内的 `#` 一律保留）。例：`3 dC  # 备份目录`。
 
@@ -111,6 +117,7 @@ def parse_config(text: str) -> tuple[dict[int, str], list[tuple[int, int, str]]]
             nums = [int(n) for n in re.findall(r"\d+", head)]
             if len(nums) < 2:
                 raise ValueError(f"无法解析比较对行（需要两个编号）：{raw!r}")
+            build_rules(excludes)  # 提前校验 !replace 写法，报错按配置错误提示
             for a, b in zip(nums, nums[1:]):
                 pairs.append((a, b, excludes))
 
@@ -122,7 +129,7 @@ def parse_config(text: str) -> tuple[dict[int, str], list[tuple[int, int, str]]]
     return paths, pairs
 
 
-# ---------------------------------------------------------------- 通配排除
+# ---------------------------------------------------------------- 通配排除与豁免规则
 
 class Matcher:
     """单个通配规则：不含 `/` 时匹配任意层级的文件名或目录名，含 `/` 时匹配相对路径。"""
@@ -177,13 +184,109 @@ class Matcher:
         return self.rx is not None and self.rx.fullmatch(value) is not None
 
 
-def build_matchers(patterns: str) -> list[Matcher]:
-    matchers = []
-    for token in re.split(r"[,;、\s]+", patterns or ""):
-        token = token.strip()
-        if token and token != "*":
-            matchers.append(Matcher(token))
-    return matchers
+_TOKEN_SEPS = ",;、"
+_RULE_FMT = "!replace:路径通配:行号:文本A:文本B"
+# 占位符：文本A/文本B 都换成它，两侧同处不同便互相抵掉；取正常文本里不会出现的字节串
+_EQ_MARK = b"\x00\x01\x00"
+
+
+class ReplaceRule:
+    """`!replace:路径通配:行号:文本A:文本B`：在指定行（`*` 为任意行）内把两段文本抹平。"""
+
+    __slots__ = ("matcher", "line", "marks")
+
+    def __init__(self, path: str, line: str, text_a: str, text_b: str):
+        if not path:
+            raise ValueError(f"{_RULE_FMT} 缺少路径通配")
+        if not text_a or not text_b:
+            raise ValueError(f"{_RULE_FMT} 的两段文本都不能为空")
+        self.matcher = Matcher(path)
+        if line == "*":
+            self.line = None
+        elif line.isdigit() and line != "0":
+            self.line = int(line)
+        else:
+            raise ValueError(f"{_RULE_FMT} 的行号应为 '*' 或正整数，实际是 {line!r}")
+        self.marks = _encodings(text_a) + _encodings(text_b)
+
+    def hit(self, rel: str) -> bool:
+        return self.matcher.hit(rel)
+
+    def fold(self, lineno: int, line: bytes) -> bytes:
+        if self.line is not None and self.line != lineno:
+            return line
+        for mark in self.marks:
+            line = line.replace(mark, _EQ_MARK)
+        return line
+
+
+def _encodings(text: str) -> list[bytes]:
+    """配置可能是 GBK 而文件是 UTF-8（反之亦然），两种字节形态都参与抹平。"""
+    out: list[bytes] = []
+    for enc in ("utf-8", "gbk"):
+        try:
+            raw = text.encode(enc)
+        except UnicodeEncodeError:
+            continue
+        if raw not in out:
+            out.append(raw)
+    return out
+
+
+def _read_field(s: str, i: int, stops: str, ws: bool) -> tuple[str, int]:
+    """读一个参数：引号内原样保留，否则读到停止字符（ws 时空白也算停止符）为止。"""
+    if i < len(s) and s[i] in "\"'":
+        quote = s[i]
+        j = s.find(quote, i + 1)
+        if j < 0:
+            raise ValueError("引号没有闭合")
+        return s[i + 1:j], j + 1
+    j = i
+    while j < len(s) and s[j] not in stops and not (ws and s[j].isspace()):
+        j += 1
+    return s[i:j], j
+
+
+def _parse_replace(s: str, start: int) -> tuple[ReplaceRule, int]:
+    """从 s[start] == '!' 处解析一条规则，返回 (规则, 结束下标)。"""
+    end = s.find(":", start + 1)
+    kind = s[start + 1:] if end < 0 else s[start + 1:end]
+    if kind != "replace":
+        raise ValueError(f"未知的排除动作 '!{kind}'，格式应为 {_RULE_FMT}")
+    args: list[str] = []
+    i = end
+    for stops, ws in ((":", True), (":", True), (":", False), (_TOKEN_SEPS, True)):
+        if i >= len(s) or s[i] != ":":
+            raise ValueError(f"{_RULE_FMT} 参数不足")
+        value, i = _read_field(s, i + 1, stops, ws)
+        args.append(value)
+    try:
+        return ReplaceRule(*args), i
+    except ValueError as exc:
+        raise ValueError(f"{exc}：{s[start:i]!r}") from None
+
+
+def build_rules(patterns: str) -> tuple[list[Matcher], list[ReplaceRule]]:
+    """拆排除串：普通 token 按通配处理，`!` 开头的是豁免规则（其参数可用引号含分隔符）。"""
+    s = patterns or ""
+    n = len(s)
+    matchers: list[Matcher] = []
+    rules: list[ReplaceRule] = []
+    i = 0
+    while i < n:
+        if s[i] in _TOKEN_SEPS or s[i].isspace():
+            i += 1
+        elif s[i] == "!":
+            rule, i = _parse_replace(s, i)
+            rules.append(rule)
+        else:
+            j = i
+            while j < n and s[j] not in _TOKEN_SEPS and not s[j].isspace():
+                j += 1
+            if s[i:j] != "*":
+                matchers.append(Matcher(s[i:j]))
+            i = j
+    return matchers, rules
 
 
 def is_excluded(rel: str, matchers: list[Matcher]) -> bool:
@@ -244,6 +347,28 @@ def is_binary(path: str) -> bool:
         return True
 
 
+def ignored_by_replace(rel: str, path_a: str, path_b: str,
+                       rules: list[ReplaceRule]) -> bool:
+    """套用 !replace 规则后两侧内容一致，则该差异不计为异常。"""
+    hits = [r for r in rules if r.hit(rel)]
+    if not hits or is_binary(path_a) or is_binary(path_b):
+        return False
+    try:
+        with open(path_a, "rb") as fa, open(path_b, "rb") as fb:
+            return _fold(fa.read(), hits) == _fold(fb.read(), hits)
+    except OSError:
+        return False
+
+
+def _fold(data: bytes, rules: list[ReplaceRule]) -> bytes:
+    lines = normalize_eol(data).split(b"\n")
+    for i, line in enumerate(lines, 1):
+        for rule in rules:
+            line = rule.fold(i, line)
+        lines[i - 1] = line
+    return b"\n".join(lines)
+
+
 def diff_reason(a: str, b: str) -> str | None:
     """None 表示一致；行尾符归一化后相同则返回 REASON_EOL。"""
     try:
@@ -261,18 +386,19 @@ def diff_reason(a: str, b: str) -> str | None:
 class Anomaly:
     """一个比较项（配置里的路径对）的异常结果，files 是其文件级明细。"""
 
-    __slots__ = ("a", "b", "label", "excludes", "files", "eol")
+    __slots__ = ("a", "b", "label", "excludes", "files", "eol", "ignored")
 
     def __init__(self, a: str, b: str, label: str, excludes: str,
-                 files: list[tuple[str, str]], eol: list[str]):
-        self.a, self.b, self.label, self.excludes, self.files, self.eol = \
-            a, b, label, excludes, files, eol
+                 files: list[tuple[str, str]], eol: list[str],
+                 ignored: list[str]):
+        self.a, self.b, self.label, self.excludes, self.files, self.eol, self.ignored = \
+            a, b, label, excludes, files, eol, ignored
 
 
 def compare_pair(paths: dict[int, str], num_a: int, num_b: int,
                  excludes: str) -> Anomaly:
     root_a, root_b = paths[num_a], paths[num_b]
-    matchers = build_matchers(excludes)
+    matchers, rules = build_rules(excludes)
     both_files = os.path.isfile(root_a) and os.path.isfile(root_b)
     if both_files:
         # 单文件对单文件：两侧文件名可能不同，仍算同一个比较项
@@ -284,6 +410,7 @@ def compare_pair(paths: dict[int, str], num_a: int, num_b: int,
 
     files: list[tuple[str, str]] = []
     eol: list[str] = []
+    ignored: list[str] = []
     for key in sorted(set(fa) | set(fb)):
         rel_a, a = fa.get(key, (None, None))
         rel_b, b = fb.get(key, (None, None))
@@ -297,10 +424,12 @@ def compare_pair(paths: dict[int, str], num_a: int, num_b: int,
                 continue
             if reason == REASON_EOL:
                 eol.append(rel_a)
+            elif rules and ignored_by_replace(rel_a, a, b, rules):
+                ignored.append(rel_a)
             else:
                 files.append((rel_a, reason))
     label = f"[{num_a}] vs [{num_b}]"
-    return Anomaly(root_a, root_b, label, excludes.strip(), files, eol)
+    return Anomaly(root_a, root_b, label, excludes.strip(), files, eol, ignored)
 
 
 # ---------------------------------------------------------------- WinMerge
@@ -342,7 +471,19 @@ def report(anomalies: list[Anomaly]) -> None:
             print(f"        {rel}    {reason}")
         if an.eol:
             print(f"        （另有 {len(an.eol)} 处仅行尾符不同，已视为一致）")
+        if an.ignored:
+            print(f"        （另有 {len(an.ignored)} 处差异命中 !replace 规则，已视为一致）")
     print(f"\n共 {len(anomalies)} 个异常比较项。")
+
+
+def consistency_note(item: Anomaly) -> str:
+    """比较项判为一致时，补充说明那些被降级处理的差异。"""
+    notes = []
+    if item.eol:
+        notes.append(f"{len(item.eol)} 处仅行尾符不同")
+    if item.ignored:
+        notes.append(f"{len(item.ignored)} 处差异命中 !replace 规则")
+    return f"（{'，'.join(notes)}，已视为一致）" if notes else ""
 
 
 def interactive(anomalies: list[Anomaly], exe: str) -> None:
@@ -456,8 +597,7 @@ def main(argv: list[str]) -> int:
         if item.files:
             anomalies.append(item)
         else:
-            tail = f"（{len(item.eol)} 处仅行尾符不同，已视为一致）" if item.eol else ""
-            print(f"\n[{num_a}] vs [{num_b}] 一致{tail}")
+            print(f"\n[{num_a}] vs [{num_b}] 一致{consistency_note(item)}")
 
     report(anomalies)
 
